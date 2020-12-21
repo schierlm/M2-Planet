@@ -19,32 +19,138 @@
 // CONSTANT stdout 1
 // CONSTANT stderr 2
 // CONSTANT EOF 0xFFFFFFFF
+//
+// CONSTANT __FILE_BUFFER_SIZE 512
+
+// CONSTANT __FILE_BUFMODE_EMPTY 0
+// CONSTANT __FILE_BUFMODE_READ 1
+// CONSTANT __FILE_BUFMODE_WRITE 2
+
+void* calloc(int count, int size);
+
+struct __fileinfo {
+	int fd;
+	int bufmode; /* 0 = empty, 1 = read, 2 = write */
+	int bufpos;
+        int buflen;
+	char* buffer;
+};
+
+struct __fileinfo** __file_std_handles = 0;
+
+struct __fileinfo* __file_lookup_handle(FILE* f) {
+	unsigned fno = f;
+	if (fno < 3) {
+		if (0 == __file_std_handles)
+		{
+			__file_std_handles = calloc(3, sizeof(struct __fileinfo*));
+		}
+		if (0 == __file_std_handles[fno])
+		{
+			__file_std_handles[fno] = calloc(1, sizeof(struct __fileinfo));
+			__file_std_handles[fno]->fd = fno;
+			__file_std_handles[fno]->buffer = calloc(__FILE_BUFFER_SIZE, sizeof(char));
+		}
+		return __file_std_handles[fno];
+	}
+	return f;
+}
+
+int syscall_read(int fd, char* buf, unsigned count) {
+	asm("LOAD_EFFECTIVE_ADDRESS_rdi %24"
+	"LOAD_INTEGER_rdi"
+	"LOAD_EFFECTIVE_ADDRESS_rsi %16"
+	"LOAD_INTEGER_rsi"
+	"LOAD_EFFECTIVE_ADDRESS_rdx %8"
+	"LOAD_INTEGER_rdx"
+	"LOAD_IMMEDIATE_rax %0"
+	"SYSCALL");
+}
+
+int syscall_write(int fd, char* buf, unsigned count) {
+	asm("LOAD_EFFECTIVE_ADDRESS_rdi %24"
+	"LOAD_INTEGER_rdi"
+	"LOAD_EFFECTIVE_ADDRESS_rsi %16"
+	"LOAD_INTEGER_rsi"
+	"LOAD_EFFECTIVE_ADDRESS_rdx %8"
+	"LOAD_INTEGER_rdx"
+	"LOAD_IMMEDIATE_rax %1"
+	"SYSCALL");
+}
+
+// CONSTANT SEEK_SET 0
+// CONSTANT SEEK_CUR 1
+// CONSTANT SEEK_END 2
+
+int syscall_lseek(int fd, int offset, int whence)
+{
+	asm("LOAD_EFFECTIVE_ADDRESS_rdi %24"
+	"LOAD_INTEGER_rdi"
+	"LOAD_EFFECTIVE_ADDRESS_rsi %16"
+	"LOAD_INTEGER_rsi"
+	"LOAD_EFFECTIVE_ADDRESS_rdx %8"
+	"LOAD_INTEGER_rdx"
+	"LOAD_IMMEDIATE_rax %8"
+	"SYSCALL");
+}
+
+void __file_set_bufmode(struct __fileinfo* fi, int newmode)
+{
+	if (fi->bufmode != newmode)
+	{
+		if (__FILE_BUFMODE_READ == fi->bufmode && fi->bufpos < fi->buflen)
+		{
+			syscall_lseek(fi->fd, fi->bufpos - fi->buflen, SEEK_CUR);
+		}
+		else if (__FILE_BUFMODE_WRITE == fi->bufmode && fi->buflen > 0)
+		{
+			syscall_write(fi->fd, fi->buffer, fi->buflen);
+		}
+		fi->bufmode = newmode;
+		fi->bufpos = 0;
+		fi->buflen = 0;
+	}
+}
 
 int fgetc(FILE* f)
 {
-	asm("LOAD_EFFECTIVE_ADDRESS_rdi %8"
-	"LOAD_INTEGER_rdi"
-	"LOAD_IMMEDIATE_rax %0"
-	"PUSH_RAX"
-	"LOAD_EFFECTIVE_ADDRESS_rsi %0"
-	"LOAD_IMMEDIATE_rdx %1"
-	"SYSCALL"
-	"LOAD_IMMEDIATE_rbx %0"
-	"CMP"
-	"POP_RAX"
-	"JUMP_NE %FUNCTION_fgetc_Done"
-	"LOAD_IMMEDIATE_rax %-1"
-	":FUNCTION_fgetc_Done");
+	struct __fileinfo* fi = __file_lookup_handle(f);
+	if (__FILE_BUFMODE_READ == fi->bufmode && fi->bufpos < fi->buflen)
+	{
+		fi->bufpos = fi->bufpos + 1;
+		return fi->buffer[fi->bufpos - 1];
+	}
+	__file_set_bufmode(fi, __FILE_BUFMODE_READ);
+	fi->buflen = syscall_read(fi->fd, fi->buffer, __FILE_BUFFER_SIZE);
+	if(0 < fi->buflen)
+	{
+		fi->bufpos = 1;
+		return fi->buffer[0];
+	}
+	else
+	{
+		fi->bufpos = 0;
+		return EOF;
+	}
 }
 
 void fputc(char s, FILE* f)
 {
-	asm("LOAD_IMMEDIATE_rax %1"
-	"LOAD_EFFECTIVE_ADDRESS_rdi %8"
-	"LOAD_INTEGER_rdi"
-	"LOAD_EFFECTIVE_ADDRESS_rsi %16"
-	"LOAD_IMMEDIATE_rdx %1"
-	"SYSCALL");
+	struct __fileinfo* fi = __file_lookup_handle(f);
+	__file_set_bufmode(fi, __FILE_BUFMODE_WRITE);
+	if (fi->buflen == __FILE_BUFFER_SIZE)
+	{
+		syscall_write(fi->fd, fi->buffer, fi->buflen);
+		fi->buflen = 0;
+	}
+	fi->buffer[fi->buflen] = s;
+	fi->buflen = fi->buflen + 1;
+	if (fi->fd < 3)
+	{
+		/* flush std streams immediately */
+		syscall_write(fi->fd, fi->buffer, fi->buflen);
+		fi->buflen = 0;
+	}
 }
 
 /* Important values needed for open */
@@ -62,8 +168,7 @@ void fputc(char s, FILE* f)
 /* 00400 in octal is 256 */
 // CONSTANT S_IRUSR 256
 
-
-FILE* open(char* name, int flag, int mode)
+int open(char* name, int flag, int mode)
 {
 	asm("LOAD_EFFECTIVE_ADDRESS_rdi %24"
 	"LOAD_INTEGER_rdi"
@@ -77,7 +182,7 @@ FILE* open(char* name, int flag, int mode)
 
 FILE* fopen(char* filename, char* mode)
 {
-	FILE* f;
+	int f;
 	if('w' == mode[0])
 	{ /* 577 is O_WRONLY|O_CREAT|O_TRUNC, 384 is 600 in octal */
 		f = open(filename, 577 , 384);
@@ -92,42 +197,40 @@ FILE* fopen(char* filename, char* mode)
 	{
 		return 0;
 	}
-	return f;
+	struct __fileinfo* fi = calloc(1, sizeof(struct __fileinfo));
+	fi->buffer = calloc(__FILE_BUFFER_SIZE, sizeof(char));
+	fi->fd = f;
+	return fi;
 }
 
-int close(int fd)
+int syscall_close(int fd)
 {
 	asm("LOAD_EFFECTIVE_ADDRESS_rdi %8"
 	"LOAD_INTEGER_rdi"
 	"LOAD_IMMEDIATE_rax %3"
 	"SYSCALL");
 }
+
 int fclose(FILE* stream)
 {
-	int error = close(stream);
+	struct __fileinfo* fi = __file_lookup_handle(stream);
+	__file_set_bufmode(fi, __FILE_BUFMODE_EMPTY);
+	int error = syscall_close(fi->fd);
 	return error;
 }
 
-int fflush(FILE *stream){
-	/* We don't buffer, nothing to flush */
+int fflush(FILE *stream)
+{
+	struct __fileinfo* fi = __file_lookup_handle(stream);
+	__file_set_bufmode(fi, __FILE_BUFMODE_EMPTY);
 	return 0;
 }
 
-// CONSTANT SEEK_SET 0
-// CONSTANT SEEK_CUR 1
-// CONSTANT SEEK_END 2
-
 int fseek(FILE* f, long offset, int whence)
 {
-	/* Uses lseek directly */
-	asm("LOAD_EFFECTIVE_ADDRESS_rdi %24"
-	"LOAD_INTEGER_rdi"
-	"LOAD_EFFECTIVE_ADDRESS_rsi %16"
-	"LOAD_INTEGER_rsi"
-	"LOAD_EFFECTIVE_ADDRESS_rdx %8"
-	"LOAD_INTEGER_rdx"
-	"LOAD_IMMEDIATE_rax %8"
-	"SYSCALL");
+	struct __fileinfo* fi = __file_lookup_handle(f);
+	__file_set_bufmode(fi, __FILE_BUFMODE_EMPTY);
+	return syscall_lseek(fi->fd, offset, whence);
 }
 
 void rewind(FILE* f)
